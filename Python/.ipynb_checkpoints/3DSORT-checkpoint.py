@@ -12,6 +12,8 @@ import copy
 from pprint import pprint
 import os
 from copy import deepcopy
+import xml.etree.ElementTree as ET
+
 #--------------------------
 # mTensor Creation Functions
 #--------------------------
@@ -27,7 +29,6 @@ def mTensorCreate(tensor,meta,path=False):
         if not meta.get("Path"):
             meta["Path"] = path
     
-    print(tensor.shape)
     dimSizes=getDimSizes(meta["DimensionOrder"],tensor)
     
     meta["SizeX"]=dimSizes.get("X", 1)
@@ -37,6 +38,27 @@ def mTensorCreate(tensor,meta,path=False):
     meta["SizeT"]=dimSizes.get("T", 1)
 
     mTensor = MetaTensor(tensor, meta=meta) 
+    return mTensor
+
+def omeTiff2mTensor(path,meta={},level=0):
+    with tifffile.TiffFile(path) as tif:
+        ome_xml = tif.ome_metadata
+        
+        series = tif.series[0]             # most OME-TIFFs store the image here
+        
+        print("Number of pyramid levels:", len(series.levels))
+        
+        for i, lvl in enumerate(series.levels):
+            print(f"Level {i} shape:", lvl.shape)
+    
+        img = tif.series[0].levels[level].asarray()
+        metadata={"ome_xml":ome_xml}
+        try:
+            meta = parseXeniumMetaData(img,ome_xml)|metadata
+        except:
+            print("Warning: Did not parse ome_xml meta data")
+            meta= {"DimensionOrder":"YXC"} | metadata
+    mTensor=mTensorCreate(img,meta=meta,path=path)
     return mTensor
 
 def tif2mTensor(tifPath,meta={}):
@@ -86,6 +108,9 @@ def seg2mTensor(segPath,meta={}):
     seg = np.moveaxis(seg, -1, 0)
     seg = np.transpose(seg, (0, 2, 1)) 
     meta.update(seg_header)
+    newMeta={
+        "DimensionOrder":"ZYXC"
+    }
     return mTensorCreate(seg,meta,path=segPath)
     
 def image2mTensor(imgPath,meta={}):
@@ -102,6 +127,19 @@ def image2mTensor(imgPath,meta={}):
     }
     return mTensorCreate(imgTensor, meta|new_meta, path=imgPath)
 
+def saveMetaTensor(mTensor, path):
+    obj = {
+        "tensor": mTensor.as_tensor(),  # raw PyTorch tensor
+        "meta": mTensor.meta            # metadata dictionary
+    }
+    torch.save(obj, path)
+
+def loadMetaTensor(path):
+    obj = torch.load(path)
+    tensor = obj["tensor"]
+    meta = obj["meta"]
+    return MetaTensor(tensor, meta=meta)
+
 #------------------------
 # mTensor Helper Functions
 #------------------------
@@ -114,12 +152,24 @@ def displayMetaTensor2D(mTensor,showMetaData=False, cmap="plasma", showAxis=True
     h, w = img_np.shape[:2]
     if max(h, w) > max_size:
         scale_factor = max_size / max(h, w)
-        img_np = scale(img_np,scale_factor)
-
+        img_np = numpy.array(scale(mTensor,scale_factor))[:,:,z]
+    print(img_np.shape)
      # --- Display ---
     plt.figure(figsize=(6,6))
     plt.imshow(img_np,cmap=cmap)
-    plt.title(f"{name} | shape: {tuple(mTensor.shape)} | scale={scale_factor:.2f}")
+    
+    title=f"{name} | "
+    if mTensor.meta["SizeZ"]!=1:
+        title+=f'Z({mTensor.meta["SizeZ"]}), '
+    title+=f'Y({mTensor.meta["SizeY"]}), X({mTensor.meta["SizeX"]})'
+    if mTensor.meta["SizeC"]!=1:
+        title+=f', C({mTensor.meta["SizeC"]})'
+    if mTensor.meta["SizeT"]!=1:
+        title+=f', Z({mTensor.meta["SizeT"]})'
+    if mTensor.meta["SizeZ"]!=1:
+        title=title+ f' | z={z}'
+    plt.title(title)
+    
     if not showAxis:
         plt.axis("off")
     plt.show()
@@ -206,7 +256,7 @@ def padImageStack(images, fill_value=0):
     return np.stack(padded)
 
 
-def scale_new(mTensor, s,meta=False):
+def scale(mTensor, s,meta=False):
     
     try: 
         if meta:
@@ -308,7 +358,83 @@ def extraxtXYSlice(mTensor,z=0):
     return img_out
 
     
+#---------------------
+# Other Help Functions
+#---------------------
 
+def strip_namespace(tag):
+    """Remove {namespace} from tag strings."""
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+def etree_to_dict(elem):
+    """Convert an ElementTree node to a dict (namespace-stripped)."""
+    d = {strip_namespace(elem.tag): {}}
+
+    # Process attributes
+    for k, v in elem.attrib.items():
+        d[strip_namespace(elem.tag)][ k] = v
+
+    # Process children
+    children = list(elem)
+    if children:
+        child_dict = {}
+        for child in children:
+            cdict = etree_to_dict(child)
+            tag = list(cdict.keys())[0]
+            child_dict.setdefault(tag, []).append(cdict[tag])
+        d[strip_namespace(elem.tag)].update(child_dict)
+
+    # Process text
+    text = (elem.text or '').strip()
+    if text:
+        if d[strip_namespace(elem.tag)]:
+            d[strip_namespace(elem.tag)]['#text'] = text
+        else:
+            d[strip_namespace(elem.tag)] = text
+
+    return d
+
+    
+def parseXeniumMetaData(img,ome_xml,meta={}):
+    root = ET.fromstring(ome_xml)
+    metadataOld=etree_to_dict(root)
+
+    pixels = metadataOld['OME']['Image'][0]['Pixels'][0]
+
+    # Sanity check XY scale
+    if pixels['PhysicalSizeX'] != pixels['PhysicalSizeY']:
+        raise ValueError(f"XY Scaling Error")
+
+    # --- Build base metadata ---
+    metadata = {
+        'SizeX': int(pixels['SizeX']),
+        'SizeY': int(pixels['SizeY']),
+        'SizeZ': int(pixels['SizeZ']),
+        'SizeC': int(pixels['SizeC']),
+        "SizeT": int(pixels['SizeT']),
+        'PixelSize': float(pixels['PhysicalSizeX']),
+        'PixelSizeUnit': pixels['PhysicalSizeXUnit'],
+        "OldOMExmlData":metadataOld
+    }
+
+    shape = img.shape
+    dims = []
+
+    # Check each standard OME axis
+    if metadata["SizeZ"] > 1: 
+        dims.append("Z")
+    dims.extend(["X", "Y"])
+    if metadata["SizeC"] > 1:
+        dims.append("C")
+    if metadata["SizeT"] > 1:
+        dims.append("T")
+
+    # Join to string
+    metadata["DimensionOrder"] = "".join(dims)
+    print(metadata["DimensionOrder"])
+    return  meta | metadata
 
 
 #def removeBackground(img):
