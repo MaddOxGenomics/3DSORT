@@ -18,8 +18,62 @@ import xml.etree.ElementTree as ET
 # mTensor Creation Functions
 #--------------------------
 
+def mTensorSave(mTensor, path):
+    """
+    Saves a MONAI MetaTensor object to a file
+
+    mTensor : MetaTensor
+        The MetaTensor instance you wish to save
+    path : str
+        Full file path including filename and extension (e.g., "tensor.mt")
+    returns: None
+    
+    example: 
+        mTensorSave(myMetaTensor, "saved/myTensor.mTensor"
+    """
+
+    obj = {
+        "tensor": mTensor.as_tensor(),  # raw PyTorch tensor
+        "meta": mTensor.meta            # metadata dictionary
+    }
+    torch.save(obj, path)
+
+def mTensorLoad(path):
+    """
+    Loads a MetaTensor object to a variable
+
+    path : str
+        Full file path including filename and extension (e.g., "tensor.mt")
+    returns: OMAI MetaTensor
+    
+    
+    example: 
+        mTensorLoad("saved/myTensor.mTensor"
+    """
+    
+    obj = torch.load(path)
+    tensor = obj["tensor"]
+    meta = obj["meta"]
+    return MetaTensor(tensor, meta=meta)
 
 def mTensorCreate(tensor,meta,path=False):
+    """
+    Creates a MONAI MetaTensor with updated metadata fields (helper function)
+
+    tensor : Torch tensor
+        The raw tensor data used to construct the MetaTensor
+    meta : dict
+        Metadata dictionary. Missing fields will be filled automatically.
+    path : str or False
+        Optional file path. If provided, Name, Ext, and Path will be inferred when absent.
+    
+    returns: MetaTensor
+        The constructed MONAI MetaTensor with enriched metadata.
+    
+    example:
+        mTensorCreate(myTensor, myMeta, "output/myTensor.mTensor")
+    """
+
     if path:
         if "." in path:
             if not meta.get("Name"):
@@ -30,7 +84,7 @@ def mTensorCreate(tensor,meta,path=False):
             meta["Path"] = path
     
     dimSizes=getDimSizes(meta["DimensionOrder"],tensor)
-    
+    print(dimSizes)
     meta["SizeX"]=dimSizes.get("X", 1)
     meta["SizeY"]=dimSizes.get("Y", 1)
     meta["SizeZ"]=dimSizes.get("Z", 1)
@@ -41,6 +95,23 @@ def mTensorCreate(tensor,meta,path=False):
     return mTensor
 
 def omeTiff2mTensor(path,meta={},level=0):
+    """
+    Loads an OME-TIFF file and converts it into a MONAI MetaTensor
+
+    path : str
+        Full file path to the OME-TIFF image
+    meta : dict
+        Optional metadata dictionary. Parsed OME metadata will extend this.
+    level : int
+        Pyramid level to read from the OME-TIFF (0 = full resolution)
+    
+    returns: MetaTensor
+        A MONAI MetaTensor constructed from the selected pyramid level image
+    
+    example:
+        omeTiff2mTensor("images/sample.ome.tif", level=1)
+    """
+   
     with tifffile.TiffFile(path) as tif:
         ome_xml = tif.ome_metadata
         
@@ -61,7 +132,22 @@ def omeTiff2mTensor(path,meta={},level=0):
     mTensor=mTensorCreate(img,meta=meta,path=path)
     return mTensor
 
-def tif2mTensor(tifPath,meta={}):
+def tif3D2mTensor(tifPath,meta={}):
+    """
+    Loads a 3D TIFF (Z-stack) file and converts it into a MONAI MetaTensor
+
+    tifPath : str
+        Full file path to the 3D TIFF image
+    meta : dict
+        Optional metadata dictionary. DimensionOrder will be set to "ZYXC".
+    
+    returns: MetaTensor
+        A MONAI MetaTensor constructed from the Z-stack TIFF
+    
+    example:
+        tif3D2mTensor("images/sample_zstack.tif")
+    """
+    
     zstack = tifffile.imread(tifPath)
     new_meta={
         "DimensionOrder":"ZYXC",
@@ -127,18 +213,109 @@ def image2mTensor(imgPath,meta={}):
     }
     return mTensorCreate(imgTensor, meta|new_meta, path=imgPath)
 
-def saveMetaTensor(mTensor, path):
-    obj = {
-        "tensor": mTensor.as_tensor(),  # raw PyTorch tensor
-        "meta": mTensor.meta            # metadata dictionary
-    }
-    torch.save(obj, path)
+def omeTiff2mTensor(path,meta={},level=0):
+    """
+            WIP Warning
+        ! WORK IN PROGRESS !
+    """
+    with tifffile.TiffFile(path) as tif:
+        ome_xml = tif.ome_metadata
+        print(ome_xml)
+        
+        series = tif.series[0]             # most OME-TIFFs store the image here
+        
+        print("Number of pyramid levels:", len(series.levels))
+        
+        for i, lvl in enumerate(series.levels):
+            print(f"Level {i} shape:", lvl.shape)
+    
+        img = tif.series[0].levels[level].asarray()
+        metadata={"ome_xml":ome_xml}
+        try:
+            parseXeniumMetaData(img,ome_xml)
+        except:
+            meta= {"DimensionOrder":"YXC"} | metadata
+    print(meta)
+    mTensor=mTensorCreate(img,meta=meta,path=morphologyPath)
+    return mTensor
 
-def loadMetaTensor(path):
-    obj = torch.load(path)
-    tensor = obj["tensor"]
-    meta = obj["meta"]
-    return MetaTensor(tensor, meta=meta)
+def mTensor2omeTiff(filename, mTensor,photometric_interp="rgb",subresolutions = 7):
+    """
+            WIP Warning
+        ! WORK IN PROGRESS !
+    """
+    if isinstance(mTensor, torch.Tensor):
+        dtype = mTensor.cpu().numpy().dtype
+        metadata=mTensor.meta
+    else:
+        raise ValueError(f"Error: Input is not mettatensor {mTensor}")
+    
+    
+    #Begin Writing File
+    fn = filename + ".ome.tif"
+    with tifffile.TiffWriter(fn,  bigtiff=True) as tif:
+
+        #Specify Options
+        options = dict(
+            photometric=photometric_interp,
+            tile=(256, 256),
+            dtype=dtype,
+            compression='jpeg2000'
+        )
+
+        #Begin Writing Pyramid Level 0
+        print("Writing pyramid level 0")
+        np=mTensor.detach().cpu().numpy()
+        print(np.shape)
+
+        metadata_base = {
+        "axes": metadata["DimensionOrder"],
+        "SizeX": metadata["SizeX"],
+        "SizeY": metadata["SizeY"],
+        "SizeC": metadata["SizeC"],
+        "PhysicalSizeX": metadata['pixelsize'],
+        "PhysicalSizeY": metadata['pixelsize'],
+        "PhysicalSizeXUnit": "um",
+        "PhysicalSizeYUnit": "um",
+        }
+        
+        tif.write(
+            np,
+            subifds=subresolutions,
+            #resolution=(1e4,1e4),
+            metadata=metadata_base,
+            #description=metadata,
+            **options
+        )
+
+        #Write other pyramid levels (each one 1/2 the resolution)
+        if 'PixelSize' in metadata:
+            ogScale= metadata['PixelSize']
+        else:
+            ogScale = 1
+            
+        new_scale = ogScale
+        s=1
+        for i in range(subresolutions):
+            s /= 2
+            new_scale=s*new_scale
+            downsample=scale(mTensor,new_scale)
+
+            downsample_np = downsample.detach().cpu().numpy()
+            
+            print("Writing pyramid level {}".format(i+1))
+            level_metadata = downsample.meta.copy()
+            
+            print(downsample_np.shape)
+            print(level_metadata['DimensionOrder'],level_metadata['SizeC'],level_metadata['SizeX'],level_metadata['SizeY'])
+
+            tif.write(
+                downsample_np,
+                subfiletype=1,
+                #resolution=(1e4*s, 1e4 *s),
+                #metadata=level_metadata,
+                **options
+            )
 
 #------------------------
 # mTensor Helper Functions
@@ -180,14 +357,6 @@ def displayMetaTensor2D(mTensor,showMetaData=False, cmap="plasma", showAxis=True
 
 
 def getDimSizes(dimOrder, arr):
-    """
-    Given a dimOrder string (e.g. 'CZYX') and an array/tensor,
-    return a dict mapping each dimension letter to its size.
-    
-    arr can be:
-        - numpy array
-        - torch tensor
-    """
     # Get shape tuple
     if hasattr(arr, "shape"):   # works for torch + numpy
         shape = tuple(arr.shape)
@@ -203,13 +372,6 @@ def getDimSizes(dimOrder, arr):
     return {dimOrder[i]: shape[i] for i in range(len(dimOrder))}
 
 def createDimSizes(dimOrder, tensor):
-    """
-    Create a full dimSizes dict from dimOrder and a tensor.
-    Missing dims (Z, C, T) are set to 1.
-
-    dimOrder: e.g. "CZYX", "YX", "YXC"
-    tensor: torch.Tensor or numpy array
-    """
 
     shape = list(tensor.shape)  # supports torch & numpy
 
@@ -220,17 +382,16 @@ def createDimSizes(dimOrder, tensor):
 
     # Map provided dims → sizes
     sizes = {dimOrder[i]: shape[i] for i in range(len(dimOrder))}
-
     # Ensure all dims exist, missing ones = 1
     fullSizes = {
-        "X": sizes.get("X", 1),
-        "Y": sizes.get("Y", 1),
-        "Z": sizes.get("Z", 1),
-        "C": sizes.get("C", 1),
-        "T": sizes.get("T", 1),
+        "SizeX": sizes.get("X", 1),
+        "SizeY": sizes.get("Y", 1),
+        "SizeZ": sizes.get("Z", 1),
+        "SizeC": sizes.get("C", 1),
+        "SizeT": sizes.get("T", 1),
     }
-
     return fullSizes
+
 
 #------------------------
 # Image Helper Functions
@@ -270,7 +431,7 @@ def scale(mTensor, s,meta=False):
         shape=meta["DimensionOrder"]
        
     except:
-        raise ValueError(f"No Shape in metadata: {meta}")
+        raise ValueError(f"No DimensionOrder in metadata: {meta}")
     
     try:
          PixelSize=meta["PixelSize"]
@@ -356,7 +517,48 @@ def extraxtXYSlice(mTensor,z=0):
     img_out = np.transpose(img_np, finalAxes)
 
     return img_out
+    
+def imgColorChannel(img,colors=None,show=False):
+    """
+            WIP Warning
+        ! WORK IN PROGRESS !
+    """
+    # img shape: (H, W, C)
+    H, W, C = img.shape
 
+    # Normalize per channel (YXC indexing)
+    # Keep dims so broadcasting works (H, W, 1)
+    norm = (img - img.min(axis=(0,1), keepdims=True)) / \
+           (img.max(axis=(0,1), keepdims=True) - img.min(axis=(0,1), keepdims=True) + 1e-8)
+
+    # Define visualization colors
+    try:
+        if colors==None:
+            print("yas")
+            colors = np.array([
+            [1, 1, 1],   # White
+            [0, 1, 0],   # Green
+            [0, 0, 1],   # Blue
+            [1, 0, 0],   # Red
+        ], dtype=float)
+    except:
+        None
+
+    # Composite canvas
+    composite = np.zeros((H, W, 3), dtype=float)
+
+    # Build composite
+    for c in range(len(colors)):
+        composite += norm[..., c][:, :, None] * colors[c]
+
+    # Clip 0–1 for valid imshow
+    composite = np.clip(composite, 0, 1)
+    if show:
+        # Display
+        plt.figure(figsize=(8, 8))
+        plt.imshow(composite)
+        plt.show()
+    return composite
     
 #---------------------
 # Other Help Functions
